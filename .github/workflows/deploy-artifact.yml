@@ -1,24 +1,37 @@
 name: Deploy artifact
+
 on:
   repository_dispatch:
     types: [deploy-artifact-event]
+
 jobs:
+  ########################################################
+  # JOB 1 - Download artifact and prepare Docker context
+  ########################################################
+
   dowlonad-artifact-job:
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
       actions: read
+
     steps:
       ########################################################
-      # 1- Retrive parameters from payload and download artifact
+      # 1 - Retrieve parameters from payload
       ########################################################
-      - run: echo ${{ github.event.client_payload.checksum }}
 
       - name: Retrieve Payload
         run: |
-          echo ${{ github.event.client_payload.checksum }}
+          echo "Checksum: ${{ github.event.client_payload.checksum }}"
+          echo "Artifact: ${{ github.event.client_payload.artifact_name }}"
 
-      - uses: dawidd6/action-download-artifact@v9
+      ########################################################
+      # 2 - Download artifact
+      ########################################################
+
+      - name: Download artifact
+        uses: dawidd6/action-download-artifact@v9
         id: download-artifact
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -27,38 +40,77 @@ jobs:
           name: artifactjar
           path: /tmp/artifactjar
 
+      ########################################################
+      # 3 - Display downloaded files
+      ########################################################
+
       - name: Display structure of downloaded files
-        run: ls -R /tmp/artifactjar
-
-      - name: checksum of download-artifact
-        if: success()
-        id: hash
-        run: echo "HASH=$(sha1sum /tmp/artifactjar/${{ github.event.client_payload.artifact_name }} | awk '{ print $1 }')" >> $GITHUB_ENV
-
-      - name: compare checksum
         run: |
+          ls -R /tmp/artifactjar
+
+      ########################################################
+      # 4 - Calculate checksum
+      ########################################################
+
+      - name: Checksum of downloaded artifact
+        id: hash
+        run: |
+          HASH=$(sha1sum "/tmp/artifactjar/${{ github.event.client_payload.artifact_name }}" | awk '{ print $1 }')
+          echo "HASH=$HASH" >> "$GITHUB_ENV"
+
+          echo "Calculated checksum:"
+          echo "$HASH"
+
+      ########################################################
+      # 5 - Compare checksum
+      ########################################################
+
+      - name: Compare checksum
+        run: |
+          echo "Expected checksum:"
+          echo "${{ github.event.client_payload.checksum }}"
+
+          echo "Calculated checksum:"
+          echo "${{ env.HASH }}"
+
           if [ "${{ env.HASH }}" == "${{ github.event.client_payload.checksum }}" ]; then
-              echo "The checksum are equals! seccesfully operations."
+            echo "The checksums are equal! Successfully completed."
           else
-              echo "¡The checksum are no equals! failure operation."            
-              exit 1;
+            echo "The checksums are NOT equal! Operation failed."
+            exit 1
           fi
 
       ########################################################
-      # 6- Dolowload source code from default branch in order to retrive Dockerfile, and upload it as docker build context
+      # 6 - Checkout source code
       ########################################################
 
-      - uses: actions/checkout@v7
-        if: success()
-      - run: |
-          echo print the current directory show files
-          ls -la 
-          echo preparing docker build context
-          cp .docker/Dockerfile /tmp/Dockerfile
-          cp /tmp/artifactjar/${{ github.event.client_payload.artifact_name }} /tmp/${{ github.event.client_payload.artifact_name }}
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      ########################################################
+      # 7 - Prepare Docker build context
+      ########################################################
+
+      - name: Prepare Docker build context
+        run: |
+          echo "Current directory:"
+          ls -la
+
+          echo "Preparing Docker build context..."
+
+          cp ".docker/Dockerfile" "/tmp/Dockerfile"
+
+          cp "/tmp/artifactjar/${{ github.event.client_payload.artifact_name }}" \
+             "/tmp/${{ github.event.client_payload.artifact_name }}"
+
+          echo "Contents of /tmp:"
           ls -la /tmp
 
-      - name: Upload artifact
+      ########################################################
+      # 8 - Upload Docker build context
+      ########################################################
+
+      - name: Upload Docker build context
         uses: actions/upload-artifact@v7
         with:
           name: dockerBuildContext
@@ -66,68 +118,90 @@ jobs:
             /tmp/Dockerfile
             /tmp/${{ github.event.client_payload.artifact_name }}
 
-  #**************************************************************
-  #2 Job for managment docker task
-  #**************************************************************
+  ########################################################
+  # JOB 2 - Build and push Docker image
+  ########################################################
+
   docker-job:
     needs:
       - dowlonad-artifact-job
 
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
       actions: read
       packages: write
+
     steps:
       ########################################################
-      # 1- Set up QEMU,  free and open-source emulator. It emulates the machine's processor through dynamic binary translation
+      # 1 - Set up QEMU
       ########################################################
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
       ########################################################
-      # 2- Set up Docker Buildx
+      # 2 - Set up Docker Buildx
       ########################################################
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
       ########################################################
-      # 3- Login to Docker Hub
+      # 3 - Login to GitHub Container Registry
       ########################################################
-      - name: Login to Docker Hub
+
+      - name: Login to GHCR
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-        ########################################################
-        # 4- Download artifact
-        ########################################################
-      - name: Download artifact
+      ########################################################
+      # 4 - Download Docker build context
+      ########################################################
+
+      - name: Download Docker build context
         uses: actions/download-artifact@v8
         with:
           name: dockerBuildContext
           path: ./dockerBuildContext
 
-        ########################################################
-        # 5- Display structure
-        ########################################################
-      - name: Display structure of downloaded files
-        run: ls -R dockerBuildContext
+      ########################################################
+      # 5 - Display structure
+      ########################################################
 
-        ########################################################
-        # 5- Display structure
-        #########################################################
-      - name: Build and push image using action
+      - name: Display structure
+        run: |
+          ls -R dockerBuildContext
+
+      ########################################################
+      # 6 - Convert repository owner to lowercase
+      ########################################################
+
+      - name: Set lowercase image name
+        run: |
+          echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/cutomer-back" >> "$GITHUB_ENV"
+
+          echo "Docker image:"
+          echo "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/cutomer-back"
+
+      ########################################################
+      # 7 - Build and push Docker image
+      ########################################################
+
+      - name: Build and push image
         uses: docker/build-push-action@v7
         with:
-          context: ./dockerBuildContext # Context where Dockerfile and artifact(.jar, .war ...) lives
-          file: ./dockerBuildContext/Dockerfile # Where  Dockerfile is it.
-          #Parameters that our Dockerfile need.
+          context: ./dockerBuildContext
+          file: ./dockerBuildContext/Dockerfile
+
           build-args: |
             JAR_FILE=${{ github.event.client_payload.artifact_name }}
             DB_PASSWORD=${{ secrets.DB_PASSWORD }}
-          push: true # Push image to registry, false by deafult.
-          tags: ghcr.io/${{ github.repository_owner}}/cutomer-back:${{ github.sha }} # The image ful name, include repository, user, image name and tag
 
+          push: true
+
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
